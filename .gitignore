@@ -3,3 +3,5 @@ __pycache__/
 .env
 .venv/
 venv/
+dash.stdout.log
+dash.stderr.log

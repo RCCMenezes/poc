@@ -7,6 +7,11 @@ import math
 import re
 import unicodedata
 import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
+from datetime import datetime
+from html import unescape
 from pathlib import Path
 
 import dash
@@ -29,7 +34,85 @@ CHAIN_COLORS = {
     "Mercadona": "#16a34a",
 }
 DEFAULT_RADIUS = 500
+ALIMARKET_RSS_FEEDS = [
+    "https://www.alimarket.es/media/rss/alimentacion.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-sector-distribucion-base-alimentaria.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-sector-alimentacion-y-bebidas.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-sector-gran-consumo.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-tiendas-de-conveniencia.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-ecommerce-de-alimentacion.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-coyuntura.xml",
+    "https://www.alimarket.es/media/rss/sectores/alimentacion-equipamiento-comercial.xml",
+]
+ALIMARKET_REPORT = "https://www.alimarket.es/alimentacion/informe/421975/informe-2026-sobre-la-distribucion-alimentaria-en-espana-por-superficie/informe-completo"
+ALIMARKET_FOOD_HOME = "https://www.alimarket.es/alimentacion"
 DATA_QUALITY_REPORT: list[dict] = []
+
+
+def load_market_news(limit: int = 12) -> list[dict]:
+    """Read public RSS metadata without reproducing subscriber-only content."""
+    items, seen = [], set()
+    for feed_url in ALIMARKET_RSS_FEEDS:
+        request = urllib.request.Request(feed_url, headers={"User-Agent": "GeomarketingDashboard/1.0"})
+        try:
+            with urllib.request.urlopen(request, timeout=5) as response:
+                root = ET.fromstring(response.read())
+            for item in root.findall(".//item"):
+                title = clean_text(item.findtext("title"))
+                link = clean_text(item.findtext("link"))
+                summary = clean_text(item.findtext("description"))
+                raw_date = clean_text(item.findtext("pubDate"))
+                if not title or not link or link in seen:
+                    continue
+                try:
+                    parsed_date = parsedate_to_datetime(raw_date)
+                    if parsed_date is None:
+                        raise ValueError("Data RSS vazia")
+                    date = parsed_date.strftime("%d/%m/%Y")
+                    sort_date = parsed_date.timestamp()
+                except Exception:
+                    try:
+                        parsed_date = datetime.fromisoformat(raw_date)
+                        date = parsed_date.strftime("%d/%m/%Y")
+                        sort_date = parsed_date.timestamp()
+                    except Exception:
+                        date, sort_date = raw_date, 0
+                seen.add(link)
+                items.append({"title": title, "link": link, "summary": summary[:280], "date": date, "sort_date": sort_date})
+        except Exception:
+            continue
+    return sorted(items, key=lambda item: item["sort_date"], reverse=True)[:limit]
+
+
+def load_featured_food_news(limit: int = 9) -> list[dict]:
+    """Extract public headline metadata from 'Destacado en Alimentación'."""
+    request = urllib.request.Request(ALIMARKET_FOOD_HOME, headers={"User-Agent": "Mozilla/5.0 GeomarketingDashboard/1.0"})
+    try:
+        with urllib.request.urlopen(request, timeout=8) as response:
+            page = response.read().decode("utf-8", errors="ignore")
+        start = page.find("Destacado en Alimentaci")
+        if start < 0:
+            return []
+        end = page.find("</section>", start)
+        section = page[start:end if end > start else start + 60000]
+        pattern = re.compile(
+            r'<h1[^>]*itemprop="headline"[^>]*>\s*<a href="([^"]+)"[^>]*>(.*?)</a>\s*</h1>\s*'
+            r'<meta[^>]*itemprop="dateCreated datePublished"[^>]*content="([^"]+)"',
+            re.I | re.S,
+        )
+        items = []
+        for link, title, raw_date in pattern.findall(section)[:limit]:
+            title = clean_text(unescape(title))
+            link = urllib.parse.urljoin(ALIMARKET_FOOD_HOME, unescape(link))
+            try:
+                date = datetime.fromisoformat(raw_date).strftime("%d/%m/%Y")
+            except Exception:
+                date = raw_date
+            if title and link:
+                items.append({"title": title, "link": link, "summary": "", "date": date, "sort_date": 0})
+        return items
+    except Exception:
+        return []
 
 
 def clean_text(x: object) -> str:
@@ -739,23 +822,23 @@ def cluster_fig(df: pd.DataFrame, title: str = ""):
     """Client-side Mapbox clusters that expand as the user zooms in."""
     if df.empty:
         return empty_fig("Sem lojas para apresentar")
-    hover = df.apply(
-        lambda r: f"<b>{r.nome}</b><br>{r.morada}<br>{r.municipio}<br>{r.latitude:.6f}, {r.longitude:.6f}",
-        axis=1,
-    )
-    color = CHAIN_COLORS.get(str(df.cadeia.iloc[0]), "#2563eb")
-    fig = go.Figure(
-        go.Scattermapbox(
-            lat=df.latitude,
-            lon=df.longitude,
+    fig = go.Figure()
+    for cadeia, group in df.groupby("cadeia", sort=False):
+        hover = group.apply(
+            lambda r: f"<b>{r.nome}</b><br>{r.morada}<br>{r.municipio}<br>{r.latitude:.6f}, {r.longitude:.6f}",
+            axis=1,
+        )
+        color = CHAIN_COLORS.get(str(cadeia), "#2563eb")
+        fig.add_trace(go.Scattermapbox(
+            lat=group.latitude,
+            lon=group.longitude,
             mode="markers",
             marker={"size": 11, "color": color, "opacity": 0.82},
             cluster={"enabled": True, "maxzoom": 13, "step": 20, "size": 34, "color": color, "opacity": 0.82},
             text=hover,
             hovertemplate="%{text}<extra></extra>",
-            name=str(df.cadeia.iloc[0]),
-        )
-    )
+            name=str(cadeia),
+        ))
     fig.update_layout(
         mapbox_style="open-street-map",
         mapbox_center={"lat": float(df.latitude.mean()), "lon": float(df.longitude.mean())},
@@ -892,8 +975,11 @@ def sidebar():
         html.Div("Análise espacial", className="side-section"),
         dcc.Link("📍 Interseções", href="/intersecoes", className="side-link"),
         dcc.Link("🔢 Matriz", href="/matriz", className="side-link"),
+        dcc.Link("🟠 Clusters", href="/clusters", className="side-link"),
         dcc.Link("⬢ Hexbin / Densidade", href="/densidade", className="side-link"),
         dcc.Link("🎯 Concorrência", href="/concorrencia", className="side-link"),
+        dcc.Link("📊 Estatísticas", href="/estatisticas", className="side-link"),
+        dcc.Link("📰 News", href="/news", className="side-link"),
         dcc.Link("✅ Qualidade dos dados", href="/qualidade", className="side-link"),
         html.Div("Downloads", className="side-section"),
         html.Button("CSV", id="download-csv-btn", className="btn btn-sm btn-light me-2"),
@@ -936,15 +1022,23 @@ def page_chain(cadeia: str):
             kpi_card("Municípios", int(df.municipio.replace('', np.nan).nunique())),
         ], className="g-3 mb-4"),
         html.Div(
-            dbc.Tabs(
-                [
-                    dbc.Tab(dcc.Graph(figure=map_fig(df, f"Pontos - {cadeia}")), label="Mapa e pontos", tab_id="points"),
-                    dbc.Tab(dcc.Graph(figure=heatmap_fig(df, f"Heatmap - {cadeia}")), label="Heatmap", tab_id="heatmap"),
-                    dbc.Tab(dcc.Graph(figure=cluster_fig(df, f"Clusters - {cadeia}")), label="Clusters", tab_id="clusters"),
-                ],
-                active_tab="points",
-                className="chain-tabs",
-            ),
+            [
+                dcc.Store(id="chain-current", data=cadeia),
+                dbc.Tabs(
+                    [
+                        dbc.Tab(label="Mapa e pontos", tab_id="points"),
+                        dbc.Tab(label="Heatmap", tab_id="heatmap"),
+                        dbc.Tab(label="Clusters", tab_id="clusters"),
+                    ],
+                    id="chain-view-tabs",
+                    active_tab="points",
+                    className="chain-tabs",
+                ),
+                dcc.Loading(
+                    dcc.Graph(id="chain-view-graph", responsive=True, style={"width": "100%", "height": "68vh", "minHeight": "620px"}),
+                    type="circle",
+                ),
+            ],
             className="cardx mb-4",
         ),
         html.Div(chain_table(df), className="cardx"),
@@ -990,6 +1084,30 @@ def page_density():
     ])
 
 
+def page_clusters():
+    return html.Div([
+        html.H1("Clusters de lojas", className="page-title"),
+        html.P(
+            "Aglomerações comerciais interativas por cadeia. Aumente o zoom para expandir cada cluster e ver as lojas.",
+            className="subtitle",
+        ),
+        dbc.Row([
+            kpi_card("Lojas agrupáveis", f"{len(DF):,}".replace(",", ".")),
+            kpi_card("Cadeias", len(CHAINS)),
+            kpi_card("Zoom de expansão", "até 13"),
+            kpi_card("Passo do cluster", "20 pontos"),
+        ], className="g-3 mb-4"),
+        html.Div(
+            dcc.Graph(figure=cluster_fig(DF, "Clusters comerciais por cadeia"), responsive=True),
+            className="cardx",
+        ),
+        html.P(
+            "Os círculos representam concentrações de lojas, não limites oficiais de aglomerações urbanas.",
+            className="small-note mt-2",
+        ),
+    ])
+
+
 def page_data_quality():
     report = pd.DataFrame(DATA_QUALITY_REPORT)
     report = report[report["registos"] > 0].copy() if not report.empty else report
@@ -1032,7 +1150,7 @@ def page_statistics():
     chain_opts = ["Todas"] + CHAINS
     return html.Div([
         html.H1("Estatísticas por Cadeia", className="page-title"),
-        html.P("Comparativo detalhado entre cadeias, municipios e distritos.", className="subtitle"),
+        html.P("Comparativo detalhado entre cadeias, municípios e distritos.", className="subtitle"),
 
         # Filtros
         html.Div([
@@ -1056,14 +1174,81 @@ def page_statistics():
 
         dbc.Row([
             dbc.Col([dcc.Graph(id="stat-pie-chain")], md=6),
-            dbc.Col([dcc.Graph(id="stat-table-chain")], md=6),
+            dbc.Col([html.Div(id="stat-table-chain", className="cardx h-100")], md=6),
         ], className="g-3"),
+    ])
+
+
+def page_news():
+    return html.Div([
+        html.H1("Destacado en Alimentación", className="page-title news-heading"),
+        html.P("Atualizações públicas sobre distribuição alimentar. Os artigos abrem sempre na fonte original.", className="subtitle"),
+        html.Div([
+            dbc.Button("↻ Atualizar agora", id="news-refresh", color="success", size="sm"),
+            html.Span(id="news-updated-at", className="news-updated-at"),
+        ], className="news-toolbar"),
+        dcc.Interval(id="news-interval", interval=15 * 60 * 1000, n_intervals=0),
+        html.Div(id="news-content"),
+    ])
+
+
+def render_news_content(news: list[dict]):
+    cards = [
+        html.Div([
+            html.A(item["title"], href=item["link"], target="_blank", rel="noopener noreferrer", className="news-title"),
+        ], className="news-card")
+        for item in news
+    ]
+    if not cards:
+        cards = [dbc.Alert(
+            "O feed de notícias está temporariamente indisponível. Use os links abaixo para consultar as fontes.",
+            color="warning",
+        )]
+    return html.Div([
+        html.Div([
+            html.Span("Relatório permanente", className="news-report-label"),
+            html.A(
+                "Informe 2026 sobre la Distribución Alimentaria en España por superficie ↗",
+                href=ALIMARKET_REPORT,
+                target="_blank",
+                rel="noopener noreferrer",
+                className="news-report-link",
+            ),
+        ], className="news-report"),
+        html.Div(cards, className="news-grid"),
+        html.P("Fonte: página pública Alimentación, Alimarket. Clique numa manchete para abrir o artigo original.", className="small-note"),
     ])
 
 
 app = Dash(__name__, external_stylesheets=[dbc.themes.BOOTSTRAP], suppress_callback_exceptions=True)
 server = app.server
 app.layout = html.Div([dcc.Location(id="url"), sidebar(), html.Main(id="page", className="main")])
+
+
+@app.callback(
+    Output("chain-view-graph", "figure"),
+    Input("chain-view-tabs", "active_tab"),
+    State("chain-current", "data"),
+)
+def update_chain_map(active_tab, cadeia):
+    df = DF[DF.cadeia == cadeia].copy()
+    if active_tab == "heatmap":
+        return heatmap_fig(df, f"Heatmap - {cadeia}")
+    if active_tab == "clusters":
+        return cluster_fig(df, f"Clusters - {cadeia}")
+    return map_fig(df, f"Pontos - {cadeia}")
+
+
+@app.callback(
+    Output("news-content", "children"),
+    Output("news-updated-at", "children"),
+    Input("news-interval", "n_intervals"),
+    Input("news-refresh", "n_clicks"),
+)
+def refresh_market_news(_intervals, _clicks):
+    news = load_featured_food_news() or load_market_news(limit=9)
+    timestamp = datetime.now().strftime("Atualizado em %d/%m/%Y às %H:%M")
+    return render_news_content(news), timestamp
 
 
 @app.callback(Output("page", "children"), Input("url", "pathname"))
@@ -1078,10 +1263,16 @@ def router(pathname):
             return page_intersections()
         if pathname == "/matriz":
             return page_matrix()
+        if pathname == "/clusters":
+            return page_clusters()
         if pathname == "/densidade":
             return page_density()
         if pathname == "/concorrencia":
             return page_competition()
+        if pathname == "/estatisticas":
+            return page_statistics()
+        if pathname == "/news":
+            return page_news()
         if pathname == "/qualidade":
             return page_data_quality()
         return page_dashboard()
@@ -1270,8 +1461,31 @@ def update_statistics(chain_filter):
                 showlegend=False
             )
         else:
-            # Mostrar apenas uma cadeia - não tem sentido gráfico
-            fig_bar_chain = empty_fig("Selecione 'Todas' para ver o comparativo entre cadeias")
+            # Para uma cadeia, mostrar a qualidade/completude dos campos principais.
+            fields = {
+                "Morada": "morada",
+                "Município": "municipio",
+                "Distrito": "distrito",
+                "Telefone": "telefone",
+                "Email": "email",
+            }
+            coverage = []
+            for label, column in fields.items():
+                values = df[column].fillna("").astype(str).str.strip()
+                coverage.append({"campo": label, "percentagem": round((values != "").mean() * 100, 1) if len(df) else 0})
+            coverage_df = pd.DataFrame(coverage)
+            fig_bar_chain = px.bar(
+                coverage_df,
+                x="campo",
+                y="percentagem",
+                text="percentagem",
+                range_y=[0, 100],
+                title=f"Completude dos dados — {chain_filter}",
+                labels={"campo": "Campo", "percentagem": "Registos preenchidos (%)"},
+                height=400,
+            )
+            fig_bar_chain.update_traces(texttemplate="%{text:.1f}%", textposition="outside", marker_color=CHAIN_COLORS.get(chain_filter, "#2563eb"))
+            fig_bar_chain.update_layout(showlegend=False)
 
         # Gráfico de barras - Quantidade por município
         muni_counts = df.groupby("municipio").size().sort_values(ascending=False).head(15)
@@ -1313,7 +1527,16 @@ def update_statistics(chain_filter):
                 showlegend=True
             )
         else:
-            fig_pie_chain = empty_fig("Selecione 'Todas' para ver a distribuição por cadeias")
+            muni_values = df["municipio"].fillna("").astype(str).str.strip().replace("", "Município desconhecido")
+            muni_pie = muni_values.value_counts()
+            if len(muni_pie) > 10:
+                muni_pie = pd.concat([muni_pie.head(10), pd.Series({"Outros": int(muni_pie.iloc[10:].sum())})])
+            fig_pie_chain = go.Figure([go.Pie(labels=muni_pie.index, values=muni_pie.values, hole=0.4)])
+            fig_pie_chain.update_layout(
+                title=f"Distribuição territorial — {chain_filter}",
+                height=400,
+                showlegend=True,
+            )
 
         # Tabela - Comparativo por cadeia (se filtro for 'Todas')
         if chain_filter == "Todas":
@@ -1351,11 +1574,17 @@ def update_statistics(chain_filter):
             ])
         else:
             table = html.Div([
-                html.H5("Detalhes da cadeia:", className="mt-3 mb-2"),
+                html.H5(f"Amostra de lojas — {chain_filter}", className="mb-2"),
                 dash_table.DataTable(
-                    data=df.to_dict('records'),
-                    columns=[{"name": c, "id": c} for c in df.columns],
-                    page_size=50,
+                    data=df[["nome", "municipio", "distrito", "morada", "telefone"]].to_dict('records'),
+                    columns=[
+                        {"name": "Loja", "id": "nome"},
+                        {"name": "Município", "id": "municipio"},
+                        {"name": "Distrito", "id": "distrito"},
+                        {"name": "Morada", "id": "morada"},
+                        {"name": "Telefone", "id": "telefone"},
+                    ],
+                    page_size=12,
                     style_table={"overflowX": "auto"},
                     style_header={
                         "backgroundColor": "rgb(230, 230, 230)",
