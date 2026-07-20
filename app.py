@@ -5,6 +5,7 @@ import itertools
 import json
 import math
 import re
+import time
 import unicodedata
 import urllib.request
 import urllib.parse
@@ -47,6 +48,56 @@ ALIMARKET_RSS_FEEDS = [
 ALIMARKET_REPORT = "https://www.alimarket.es/alimentacion/informe/421975/informe-2026-sobre-la-distribucion-alimentaria-en-espana-por-superficie/informe-completo"
 ALIMARKET_FOOD_HOME = "https://www.alimarket.es/alimentacion"
 DATA_QUALITY_REPORT: list[dict] = []
+ESP_ADM2_PATH = DATA_DIR / "geoboundaries_esp_adm2_simplified.geojson"
+ESP_ADM2_GEOJSON = json.loads(ESP_ADM2_PATH.read_text(encoding="utf-8")) if ESP_ADM2_PATH.exists() else None
+
+
+def volta_candidates() -> pd.DataFrame:
+    """Combine store points with the cadastral checks already completed."""
+    columns = [
+        "cadeia", "nome", "morada", "municipio", "latitude", "longitude",
+        "referencia_cadastral", "uso_cadastral", "area_edificio_m2",
+        "contexto", "status_volta", "motivo", "fonte_area",
+    ]
+    stores = DF[["cadeia", "nome", "morada", "municipio", "latitude", "longitude"]].copy()
+    stores["coord_key"] = stores["latitude"].round(6).astype(str) + "|" + stores["longitude"].round(6).astype(str)
+    source = DATA_DIR / "candidatos_volta.csv"
+    if source.exists():
+        checks = pd.DataFrame()
+        for attempt in range(3):
+            try:
+                checks = pd.read_csv(source)
+                break
+            except (pd.errors.EmptyDataError, pd.errors.ParserError, PermissionError):
+                if attempt == 2:
+                    raise
+                time.sleep(0.15)
+        checks["coord_key"] = checks["latitude"].round(6).astype(str) + "|" + checks["longitude"].round(6).astype(str)
+        checks = checks.drop(columns=["cadeia", "latitude", "longitude"], errors="ignore")
+        stores = stores.merge(checks, on="coord_key", how="left")
+    for col in columns:
+        if col not in stores:
+            stores[col] = np.nan if col == "area_edificio_m2" else ""
+    def classify_volta(row):
+        current = clean_text(row.get("status_volta"))
+        if current:
+            return current
+        area = row.get("area_edificio_m2")
+        if pd.isna(area):
+            return "Verificar"
+        if float(area) < 400:
+            return "Improvável"
+        if float(area) > 5000:
+            return "Centro comercial"
+        return "Provável"
+
+    stores["status_volta"] = stores.apply(classify_volta, axis=1)
+    stores["contexto"] = stores["contexto"].fillna("Não classificado")
+    stores["motivo"] = stores["motivo"].fillna("Área cadastral ainda por pesquisar")
+    stores["fonte_area"] = stores["fonte_area"].fillna("")
+    stores["referencia_cadastral"] = stores["referencia_cadastral"].fillna("")
+    stores["uso_cadastral"] = stores["uso_cadastral"].fillna("")
+    return stores[columns]
 
 
 def load_market_news(limit: int = 12) -> list[dict]:
@@ -708,7 +759,7 @@ def competition_map(df: pd.DataFrame, title: str):
         title=title, legend_title="Cadeia e papel",
         mapbox_center={"lat": float(all_lats.mean()), "lon": float(all_lons.mean())}, mapbox_zoom=5.2,
     )
-    return fig
+    return add_spain_adm2_layer(fig)
 
 DF_COMP = nearest_competition(DF)
 
@@ -724,34 +775,19 @@ def empty_fig(message="Sem dados"):
     return fig
 
 
-def add_admin_boundary_layers(fig, show_municipios: bool = True, show_distritos: bool = True):
-    layers = []
-    if show_municipios:
-        municipios = download_geoboundaries("ADM2", simplified=True)
-        if municipios:
-            layers.append(
-                {
-                    "sourcetype": "geojson",
-                    "source": municipios,
-                    "type": "line",
-                    "color": "rgba(15, 23, 42, 0.28)",
-                    "line": {"width": 0.7},
-                }
-            )
-    if show_distritos:
-        distritos = download_geoboundaries("ADM1", simplified=True)
-        if distritos:
-            layers.append(
-                {
-                    "sourcetype": "geojson",
-                    "source": distritos,
-                    "type": "line",
-                    "color": "rgba(220, 38, 38, 0.65)",
-                    "line": {"width": 1.8},
-                }
-            )
-    if layers:
-        fig.update_layout(mapbox_layers=layers)
+def add_spain_adm2_layer(fig):
+    """Overlay the locally cached geoBoundaries Spain ADM2 (provinces)."""
+    if ESP_ADM2_GEOJSON:
+        existing = list(fig.layout.mapbox.layers or [])
+        existing.append({
+            "sourcetype": "geojson",
+            "source": ESP_ADM2_GEOJSON,
+            "type": "line",
+            "color": "rgba(30, 64, 175, 0.78)",
+            "line": {"width": 1.35},
+            "below": "traces",
+        })
+        fig.update_layout(mapbox_layers=existing)
     return fig
 
 
@@ -786,7 +822,7 @@ def map_fig(df: pd.DataFrame, title: str = "", color_by="cadeia", mode="Pontos")
         )
     fig.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=30, b=0), title=title, legend_title="Cadeia")
     fig.update_traces(marker=dict(opacity=0.82))
-    return fig
+    return add_spain_adm2_layer(fig)
 
 
 def heatmap_fig(df: pd.DataFrame, title: str = ""):
@@ -815,7 +851,7 @@ def heatmap_fig(df: pd.DataFrame, title: str = ""):
         title=title,
         coloraxis_colorbar_title="Densidade",
     )
-    return fig
+    return add_spain_adm2_layer(fig)
 
 
 def cluster_fig(df: pd.DataFrame, title: str = ""):
@@ -847,7 +883,7 @@ def cluster_fig(df: pd.DataFrame, title: str = ""):
         margin=dict(l=0, r=0, t=30, b=0),
         title=title,
     )
-    return fig
+    return add_spain_adm2_layer(fig)
 
 
 def chain_table(df: pd.DataFrame):
@@ -933,7 +969,7 @@ def inter_map(df: pd.DataFrame):
         ))
     fig.update_layout(mapbox_style="open-street-map", height=620, margin=dict(l=0, r=0, t=20, b=0), legend_title="Cadeia")
     fig.update_mapboxes(center=dict(lat=float(pts.lat.mean()), lon=float(pts.lon.mean())), zoom=6)
-    return fig
+    return add_spain_adm2_layer(fig)
 
 
 def intersection_heatmap(df: pd.DataFrame):
@@ -962,7 +998,7 @@ def intersection_heatmap(df: pd.DataFrame):
         title="Pressão concorrencial", coloraxis_colorbar_title="Interseções",
         mapbox_center={"lat": float(pressure.lat.mean()), "lon": float(pressure.lon.mean())},
     )
-    return fig
+    return add_spain_adm2_layer(fig)
 
 
 def sidebar():
@@ -979,6 +1015,7 @@ def sidebar():
         dcc.Link("⬢ Hexbin / Densidade", href="/densidade", className="side-link"),
         dcc.Link("🎯 Concorrência", href="/concorrencia", className="side-link"),
         dcc.Link("📊 Estatísticas", href="/estatisticas", className="side-link"),
+        dcc.Link("♻️ Candidatos Volta", href="/candidatos-volta", className="side-link"),
         dcc.Link("📰 News", href="/news", className="side-link"),
         dcc.Link("✅ Qualidade dos dados", href="/qualidade", className="side-link"),
         html.Div("Downloads", className="side-section"),
@@ -1192,6 +1229,62 @@ def page_news():
     ])
 
 
+def page_volta_candidates():
+    return html.Div([
+        html.H1([
+            "Diretiva ",
+            html.A(
+                "INSPIRE",
+                href="https://www.catastro.hacienda.gob.es/webinspire/index.html",
+                target="_blank",
+                rel="noopener noreferrer",
+                className="inspire-title-link",
+            ),
+            " 2007/2/CE",
+        ], className="page-title"),
+        html.P(
+            "Triagem espacial de supermercados pelo edifício cadastral. A área apresentada é a implantação do edifício, não a área de venda confirmada.",
+            className="subtitle",
+        ),
+        html.Div([
+            dbc.Row([
+                dbc.Col([html.Label("Cadeia", className="fw-bold"), dcc.Dropdown(["Todas"] + CHAINS, None, id="volta-chain", placeholder="Escolha uma cadeia", clearable=True)], md=4),
+                dbc.Col([html.Label("Classificação", className="fw-bold"), dcc.Dropdown(
+                    ["Todos", "Provável", "Improvável", "Verificar", "Centro comercial"],
+                    None, id="volta-status", placeholder="Escolha uma classificação", clearable=True,
+                )], md=4),
+                dbc.Col([html.Label("Área mínima do edifício (m²)", className="fw-bold"), dbc.Input(id="volta-min-area", type="number", value=0, min=0)], md=4),
+            ], className="g-3")
+        ], className="cardx mb-4"),
+        html.Div(id="volta-kpis", className="mb-4"),
+        dbc.Row([
+            dbc.Col(
+                html.Div(
+                    dcc.Graph(
+                        id="volta-map",
+                        responsive=True,
+                        config={"responsive": True},
+                        style={"width": "100%", "height": "610px", "minHeight": "610px"},
+                    ),
+                    className="cardx volta-map-card",
+                ),
+                id="volta-map-col", lg=7, md=12,
+            ),
+            dbc.Col(html.Div([
+                html.H4("Critérios de triagem"),
+                html.Ul([
+                    html.Li("Provável: 400–5.000 m² e loja isolada"),
+                    html.Li("Improvável: edifício abaixo de 400 m²"),
+                    html.Li("Centro comercial: acima de 5.000 m² ou complexo multioperador"),
+                    html.Li("Verificar: área cadastral ainda desconhecida ou situação ambígua"),
+                ]),
+                dbc.Alert("A elegibilidade final exige a área de venda confirmada.", color="warning"),
+            ], className="cardx h-100"), id="volta-criteria", lg=5, md=12),
+        ], className="g-3 mb-4"),
+        html.Div(id="volta-table", className="cardx table-card"),
+    ])
+
+
 def render_news_content(news: list[dict]):
     cards = [
         html.Div([
@@ -1271,6 +1364,8 @@ def router(pathname):
             return page_competition()
         if pathname == "/estatisticas":
             return page_statistics()
+        if pathname == "/candidatos-volta":
+            return page_volta_candidates()
         if pathname == "/news":
             return page_news()
         if pathname == "/qualidade":
@@ -1286,6 +1381,86 @@ def sync_radius(v):
 
 
 @app.callback(
+    Output("volta-kpis", "children"),
+    Output("volta-map", "figure"),
+    Output("volta-table", "children"),
+    Output("volta-kpis", "style"),
+    Output("volta-map-col", "style"),
+    Output("volta-criteria", "style"),
+    Output("volta-table", "style"),
+    Input("volta-chain", "value"),
+    Input("volta-status", "value"),
+    Input("volta-min-area", "value"),
+)
+def update_volta_candidates(chain, status, min_area):
+    chain_is_all = not chain or chain == "Todas"
+    status_is_all = not status or status == "Todos"
+    initial_view = chain_is_all and status_is_all
+    if initial_view:
+        fig = go.Figure(go.Scattermapbox(lat=[], lon=[]))
+        fig.update_layout(
+            mapbox_style="open-street-map",
+            mapbox_center={"lat": 40.2, "lon": -3.7},
+            mapbox_zoom=5,
+            height=610,
+            margin=dict(l=0, r=0, t=0, b=0),
+            showlegend=False,
+        )
+        fig = add_spain_adm2_layer(fig)
+        return [], fig, [], {"display": "none"}, {"width": "100%", "flex": "0 0 100%", "maxWidth": "100%"}, {"display": "none"}, {"display": "none"}
+
+    df = volta_candidates()
+    if chain and chain != "Todas":
+        df = df[df["cadeia"] == chain]
+    if status and status != "Todos":
+        df = df[df["status_volta"] == status]
+    min_area = float(min_area or 0)
+    if min_area > 0:
+        researched = df["area_edificio_m2"].notna()
+        df = df[(~researched) | (df["area_edificio_m2"] >= min_area)]
+
+    researched_count = int(df["area_edificio_m2"].notna().sum())
+    verify_count = int((df["status_volta"] == "Verificar").sum())
+    eligible_count = int((df["status_volta"] == "Provável").sum())
+    mall_count = int((df["status_volta"] == "Centro comercial").sum())
+    kpis = dbc.Row([
+        kpi_card("Lojas apresentadas", len(df)),
+        kpi_card("Com Catastro", researched_count),
+        kpi_card("Prováveis candidatas", eligible_count),
+        kpi_card("Verificar / centros", verify_count + mall_count),
+    ], className="g-3")
+
+    colors = {"Provável": "#16a34a", "Verificar": "#f59e0b", "Improvável": "#dc2626", "Centro comercial": "#7c3aed"}
+    fig = px.scatter_mapbox(
+        df, lat="latitude", lon="longitude", color="status_volta", color_discrete_map=colors,
+        hover_name="nome", hover_data={"cadeia": True, "morada": True, "area_edificio_m2": ":.1f", "contexto": True, "latitude": False, "longitude": False},
+        zoom=5, height=610,
+    ) if not df.empty else empty_fig("Nenhum candidato com estes filtros")
+    if not df.empty:
+        fig.update_layout(mapbox_style="open-street-map", margin=dict(l=0, r=0, t=20, b=0), legend_title="Classificação")
+        fig = add_spain_adm2_layer(fig)
+
+    display = df.copy()
+    display["area_edificio_m2"] = display["area_edificio_m2"].round(1)
+    table_columns = ["cadeia", "nome", "morada", "municipio", "area_edificio_m2", "contexto", "status_volta", "motivo", "referencia_cadastral"]
+    table = dash_table.DataTable(
+        data=display[table_columns].to_dict("records"),
+        columns=[{"name": c.replace("_", " ").title(), "id": c} for c in table_columns],
+        sort_action="native", filter_action="native", page_size=15,
+        style_table={"overflowX": "auto"},
+        style_cell={"padding": "10px", "textAlign": "left", "minWidth": "120px", "maxWidth": "280px", "whiteSpace": "normal"},
+        style_header={"fontWeight": "800", "backgroundColor": "#f8fafc"},
+        style_data_conditional=[
+            {"if": {"filter_query": '{status_volta} = "Provável"', "column_id": "status_volta"}, "color": "#15803d", "fontWeight": "700"},
+            {"if": {"filter_query": '{status_volta} = "Verificar"', "column_id": "status_volta"}, "color": "#c2410c", "fontWeight": "700"},
+            {"if": {"filter_query": '{status_volta} = "Improvável"', "column_id": "status_volta"}, "color": "#b91c1c", "fontWeight": "700"},
+            {"if": {"filter_query": '{status_volta} = "Centro comercial"', "column_id": "status_volta"}, "color": "#6d28d9", "fontWeight": "700"},
+        ],
+    )
+    return kpis, fig, table, {}, {}, {}, {}
+
+
+@app.callback(
     Output("inter-kpis", "children"),
     Output("inter-map", "figure"),
     Output("inter-heatmap", "figure"),
@@ -1297,13 +1472,17 @@ def update_intersections(pair_value, radius):
     try:
         radius = int(radius or DEFAULT_RADIUS)
         inter = all_intersections(radius, pair_value or "Todas")
-        unique_a = inter[["cadeia_a", "loja_a"]].drop_duplicates().shape[0] if not inter.empty else 0
-        unique_b = inter[["cadeia_b", "loja_b"]].drop_duplicates().shape[0] if not inter.empty else 0
+        # Store names repeat across a chain (for example, many rows are simply
+        # called "Dia"). Coordinates identify the physical locations reliably.
+        unique_a = inter[["cadeia_a", "lat_a", "lon_a"]].drop_duplicates().shape[0] if not inter.empty else 0
+        unique_b = inter[["cadeia_b", "lat_b", "lon_b"]].drop_duplicates().shape[0] if not inter.empty else 0
+        label_a = f"Lojas {inter.iloc[0].cadeia_a}" if not inter.empty else "Lojas lado A"
+        label_b = f"Lojas {inter.iloc[0].cadeia_b}" if not inter.empty else "Lojas lado B"
         avg = f"{inter.dist_m.mean():.0f} m" if not inter.empty else "—"
         kpis = dbc.Row([
             kpi_card("Pares encontrados", len(inter)),
-            kpi_card("Lojas lado A", unique_a),
-            kpi_card("Lojas lado B", unique_b),
+            kpi_card(label_a, unique_a),
+            kpi_card(label_b, unique_b),
             kpi_card("Distância média", avg),
         ], className="g-3")
         return kpis, inter_map(inter), intersection_heatmap(inter), intersection_table(inter)
